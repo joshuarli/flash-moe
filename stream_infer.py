@@ -1117,10 +1117,25 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
     file_handle_cache = {}
 
     # === LRU cache for expert weight slices ===
-    # Size = num_layers * active_experts_per_token * 8 tokens worth of history.
-    # E.g., 48 layers * 8 experts * 8 = 3072 (122B), or 60 * 10 * 8 = 4800 (397B).
+    # Size = num_layers * active_experts_per_token * N tokens of history.
+    # Cap total cache memory at 20GB to leave headroom for OS on 48GB machine.
     active_experts = lm.args.num_experts_per_tok
     cache_entries = num_layers * active_experts * 8
+
+    # Estimate per-entry bytes to enforce memory cap
+    hidden = lm.args.hidden_size
+    intermediate = lm.args.moe_intermediate_size
+    # 3 projections (gate, up, down) each with weight(U32,4bit) + scales(BF16) + biases(BF16)
+    # Per projection: intermediate*hidden/2 (weight) + intermediate*hidden/32 (scales+biases)
+    # = intermediate*hidden*9/16 per projection, x3 projections
+    per_expert_bytes = 3 * intermediate * hidden * 9 // 16
+    max_cache_gb = 20.0
+    max_entries_by_mem = int(max_cache_gb * 1e9 / per_expert_bytes) if per_expert_bytes > 0 else cache_entries
+    if cache_entries > max_entries_by_mem:
+        print(f"[cache] Capping entries from {cache_entries} to {max_entries_by_mem} "
+              f"(~{max_cache_gb:.0f}GB limit, {per_expert_bytes/1e6:.1f}MB/entry)")
+        cache_entries = max_entries_by_mem
+
     expert_cache = ExpertCache(max_entries=cache_entries)
 
     # === Cache quantization parameters from model config (read once) ===
