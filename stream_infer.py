@@ -405,6 +405,75 @@ _PREAD_NP_DTYPE = {
 }
 
 
+def load_packed_experts(model_path):
+    """Load packed expert layout and open layer file descriptors.
+
+    Returns (layout, packed_fds, packed_layers) or (None, None, set()) if not available.
+    """
+    packed_dir = Path(model_path) / "packed_experts"
+    layout_path = packed_dir / "layout.json"
+    if not layout_path.exists():
+        return None, None, set()
+
+    with open(layout_path) as f:
+        layout = json.load(f)
+
+    packed_fds = {}
+    packed_layers = set()
+    for layer_file in sorted(packed_dir.glob("layer_*.bin")):
+        layer_idx = int(layer_file.stem.split("_")[1])
+        fd = os.open(str(layer_file), os.O_RDONLY)
+        packed_fds[layer_idx] = fd
+        packed_layers.add(layer_idx)
+
+    _pread_fds.update({f"packed_{k}": v for k, v in packed_fds.items()})
+    print(f"[packed] Loaded {len(packed_layers)} packed layer files "
+          f"(layers {min(packed_layers)}-{max(packed_layers)})")
+    return layout, packed_fds, packed_layers
+
+
+def read_expert_packed(packed_fd, layout, expert_idx):
+    """Read a single expert from a packed layer file (1 pread for entire expert).
+
+    Returns (expert_idx, results_dict, io_stats) matching _read_single_expert_attrs format.
+    """
+    expert_size = layout["expert_size"]
+    offset = expert_idx * expert_size
+
+    t_io = time.time()
+    raw = os.pread(packed_fd, expert_size, offset)
+    io_time = time.time() - t_io
+
+    t_arr = time.time()
+    results = {}
+    for comp in layout["components"]:
+        name = comp["name"]  # e.g. "gate_proj.weight"
+        parts = name.split(".")
+        proj_name, attr_name = parts[0], parts[1]
+        comp_offset = comp["offset"]
+        comp_size = comp["size"]
+        dtype_str = comp["dtype"]
+        shape = comp["shape"]
+
+        chunk = raw[comp_offset:comp_offset + comp_size]
+        np_dtype, _ = _PREAD_NP_DTYPE[dtype_str]
+        np_arr = np.frombuffer(chunk, dtype=np_dtype).reshape(shape)
+
+        if dtype_str == 'BF16':
+            np_f32 = (np_arr.astype(np.uint32) << 16).view(np.float32)
+            results[(proj_name, attr_name)] = mx.array(np_f32).astype(mx.bfloat16)
+        else:
+            results[(proj_name, attr_name)] = mx.array(np_arr)
+    array_time = time.time() - t_arr
+
+    return expert_idx, results, {
+        "bytes_read": expert_size,
+        "seek_count": 1,
+        "io_time_s": io_time,
+        "array_time_s": array_time,
+    }
+
+
 def pread_expert(expert_index, fds, layer, expert_idx):
     """Read all 9 tensor components for a single expert using os.pread().
 
@@ -1522,6 +1591,9 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
     expert_cache = None  # may remain None when --no-expert-cache
 
+    # Try to load packed expert files (1 contiguous read per expert, 1.9x faster I/O)
+    packed_layout, packed_fds, packed_layers = load_packed_experts(model_path)
+
     if no_expert_cache:
         print(f"  [no-expert-cache] Skipping ExpertCache — OS page cache handles all expert reads.")
         print(f"  [no-expert-cache] All {active_experts} active experts read from safetensors per layer per token.")
@@ -1726,26 +1798,44 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                     if filepath not in header_cache:
                         header_cache[filepath] = parse_safetensors_header(filepath)
 
-                # Read ALL unique experts via _read_single_expert_attrs
-                # Collect per-expert results: {expert_idx: {(proj, attr): mx.array}}
+                # Read ALL unique experts — use packed format if available, else safetensors
                 all_expert_attrs = {}
-                with ThreadPoolExecutor(max_workers=min(4, num_unique)) as executor:
-                    futures = [
-                        executor.submit(
-                            _read_single_expert_attrs,
-                            expert_idx, i, expert_file_map, header_cache
-                        )
-                        for expert_idx in unique_list
-                    ]
-                    for future in futures:
-                        eidx, attrs, io_stats = future.result()
-                        all_expert_attrs[eidx] = attrs
-                        token_io_bytes += io_stats["bytes_read"]
-                        token_io_seeks += io_stats["seek_count"]
-                        token_io_time += io_stats["io_time_s"]
-                        token_array_time += io_stats["array_time_s"]
-                        if profile:
-                            layer_io_bytes += io_stats["bytes_read"]
+                if packed_layout is not None and i in packed_layers:
+                    # PACKED PATH: 1 contiguous pread per expert (1.9x faster)
+                    packed_fd = packed_fds[i]
+                    with ThreadPoolExecutor(max_workers=min(8, num_unique)) as executor:
+                        futures = [
+                            executor.submit(read_expert_packed, packed_fd, packed_layout, eidx)
+                            for eidx in unique_list
+                        ]
+                        for future in futures:
+                            eidx, attrs, io_stats = future.result()
+                            all_expert_attrs[eidx] = attrs
+                            token_io_bytes += io_stats["bytes_read"]
+                            token_io_seeks += io_stats["seek_count"]
+                            token_io_time += io_stats["io_time_s"]
+                            token_array_time += io_stats["array_time_s"]
+                            if profile:
+                                layer_io_bytes += io_stats["bytes_read"]
+                else:
+                    # SCATTERED PATH: 9 preads per expert from safetensors
+                    with ThreadPoolExecutor(max_workers=min(4, num_unique)) as executor:
+                        futures = [
+                            executor.submit(
+                                _read_single_expert_attrs,
+                                expert_idx, i, expert_file_map, header_cache
+                            )
+                            for expert_idx in unique_list
+                        ]
+                        for future in futures:
+                            eidx, attrs, io_stats = future.result()
+                            all_expert_attrs[eidx] = attrs
+                            token_io_bytes += io_stats["bytes_read"]
+                            token_io_seeks += io_stats["seek_count"]
+                            token_io_time += io_stats["io_time_s"]
+                            token_array_time += io_stats["array_time_s"]
+                            if profile:
+                                layer_io_bytes += io_stats["bytes_read"]
 
                 if profile:
                     t_io_done = time.perf_counter()
