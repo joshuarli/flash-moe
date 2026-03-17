@@ -192,11 +192,49 @@ static TensorManifest *load_manifest(const char *json_path) {
     }
 }
 
-static TensorInfo *find_tensor(TensorManifest *m, const char *name) {
+// Hash table for O(1) tensor lookup (replaces O(N) linear scan).
+// FNV-1a hash, open addressing with linear probing.
+#define TENSOR_HT_SIZE 8192  // power of 2, > 4x num_tensors (2092)
+
+typedef struct {
+    const char *key;     // tensor name (pointer into TensorInfo)
+    TensorInfo *value;   // pointer to tensor info
+} TensorHTEntry;
+
+static TensorHTEntry tensor_ht[TENSOR_HT_SIZE];
+static int tensor_ht_built = 0;
+
+static uint32_t fnv1a(const char *s) {
+    uint32_t h = 2166136261u;
+    for (; *s; s++) {
+        h ^= (uint8_t)*s;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void build_tensor_ht(TensorManifest *m) {
+    if (tensor_ht_built) return;
+    memset(tensor_ht, 0, sizeof(tensor_ht));
     for (int i = 0; i < m->num_tensors; i++) {
-        if (strcmp(m->tensors[i].name, name) == 0) {
-            return &m->tensors[i];
+        uint32_t idx = fnv1a(m->tensors[i].name) & (TENSOR_HT_SIZE - 1);
+        while (tensor_ht[idx].key) {
+            idx = (idx + 1) & (TENSOR_HT_SIZE - 1);
         }
+        tensor_ht[idx].key = m->tensors[i].name;
+        tensor_ht[idx].value = &m->tensors[i];
+    }
+    tensor_ht_built = 1;
+}
+
+static TensorInfo *find_tensor(TensorManifest *m, const char *name) {
+    if (!tensor_ht_built) build_tensor_ht(m);
+    uint32_t idx = fnv1a(name) & (TENSOR_HT_SIZE - 1);
+    while (tensor_ht[idx].key) {
+        if (strcmp(tensor_ht[idx].key, name) == 0) {
+            return tensor_ht[idx].value;
+        }
+        idx = (idx + 1) & (TENSOR_HT_SIZE - 1);
     }
     return NULL;
 }
