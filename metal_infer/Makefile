@@ -29,9 +29,13 @@ SHADER_SRC = shaders.metal
 SHADER_AIR = shaders.air
 SHADER_LIB = shaders.metallib
 
-.PHONY: all clean run verify bench moe moebench full fullbench fast metallib
+# Inference engine (complete forward pass)
+INFER_TARGET = infer
+INFER_SRC = infer.m
 
-all: $(TARGET)
+.PHONY: all clean run verify bench moe moebench full fullbench fast metallib infer infer-run
+
+all: $(TARGET) $(INFER_TARGET)
 
 # Build the binary (shaders compiled at runtime from source)
 $(TARGET): $(MAIN_SRC) $(SHADER_SRC)
@@ -46,8 +50,12 @@ $(SHADER_AIR): $(SHADER_SRC)
 $(SHADER_LIB): $(SHADER_AIR)
 	$(METALLIB_TOOL) $(SHADER_AIR) -o $(SHADER_LIB)
 
+# Build the inference engine
+$(INFER_TARGET): $(INFER_SRC)
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(INFER_SRC) -o $(INFER_TARGET)
+
 clean:
-	rm -f $(TARGET) $(SHADER_AIR) $(SHADER_LIB)
+	rm -f $(TARGET) $(INFER_TARGET) $(SHADER_AIR) $(SHADER_LIB)
 
 # Run targets
 run: $(TARGET)
@@ -73,3 +81,9 @@ full: $(TARGET)
 
 fullbench: $(TARGET)
 	./$(TARGET) --fast --full --k 4 --benchmark
+
+# Inference engine targets
+build-infer: $(INFER_TARGET)
+
+infer-run: $(INFER_TARGET)
+	./$(INFER_TARGET) --prompt "Hello, what is" --tokens 20 --k 4
