@@ -1516,7 +1516,8 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                                skip_layers=0,
                                batch_layers=0,
                                numpy_cache_gb=0.0,
-                               two_pass=False):
+                               two_pass=False,
+                               single_eval=False):
     """Generate tokens with selective expert loading for MoE models.
 
     At startup: pre-load all non-expert weights (~2.3GB) for all layers into DRAM.
@@ -1740,8 +1741,13 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             missing.append("packed expert files")
         print(f"  [two-pass] DISABLED — requires: {', '.join(missing)}")
     elif use_two_pass:
-        print(f"  [two-pass] Speculative superset: Pass 1 = routing scout (2x superset), "
-              f"Batch I/O = pre-read superset, Pass 2 = exact per-layer routing + compute.")
+        if single_eval:
+            print(f"  [two-pass+single-eval] Pass 1 = routing scout (2x superset + top-K), "
+                  f"Batch I/O = pre-read superset, Pass 2 = FULLY LAZY expert compute "
+                  f"(single mx.eval for all {num_layers} layers). No per-layer routing eval.")
+        else:
+            print(f"  [two-pass] Speculative superset: Pass 1 = routing scout (2x superset), "
+                  f"Batch I/O = pre-read superset, Pass 2 = exact per-layer routing + compute.")
 
     # === I/O instrumentation counters (per-token, reset each token) ===
     io_stats_history = []  # list of per-token dicts
@@ -1893,11 +1899,21 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                     # K_read = wider superset for pre-reading (2x the use count)
                     k_read = min(k * 2, layer.mlp.num_experts)
                     inds_superset = mx.argpartition(gates, kth=-k_read, axis=-1)[..., -k_read:]
+                    # For single-eval mode: also extract top-K indices and scores
+                    if single_eval:
+                        inds_topk = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+                        scores_topk = mx.take_along_axis(gates, inds_topk, axis=-1)
+                        scores_topk = scores_topk / scores_topk.sum(axis=-1, keepdims=True)
+                    else:
+                        inds_topk = None
+                        scores_topk = None
                 else:
                     inds_superset = None
+                    inds_topk = None
+                    scores_topk = None
                     k_read = 0
 
-                all_pass1_data[i] = (inds_superset, h_mid, k)
+                all_pass1_data[i] = (inds_superset, h_mid, k, inds_topk, scores_topk)
 
                 # Propagate with shared expert only (no routed experts)
                 shared_y = layer.mlp.shared_expert(h_post)
@@ -1907,6 +1923,12 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             # Single eval for all superset indices (batch all layers into one GPU sync)
             all_inds_to_eval = [all_pass1_data[i][0] for i in range(num_layers)
                                 if all_pass1_data[i][0] is not None]
+            # For single-eval mode: also eval topk indices and scores
+            if single_eval:
+                for i in range(num_layers):
+                    if all_pass1_data[i][3] is not None:
+                        all_inds_to_eval.append(all_pass1_data[i][3])  # topk indices
+                        all_inds_to_eval.append(all_pass1_data[i][4])  # topk scores
             if all_inds_to_eval:
                 mx.eval(*all_inds_to_eval)
 
@@ -1921,7 +1943,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             # Build per-layer superset: the set of experts to pre-read
             all_superset_info = {}  # layer_idx -> (superset_list_set, h_mid, k)
             for i in range(num_layers):
-                inds_superset_i, h_mid_i, k_i = all_pass1_data[i]
+                inds_superset_i, h_mid_i, k_i = all_pass1_data[i][0], all_pass1_data[i][1], all_pass1_data[i][2]
                 if inds_superset_i is None:
                     continue
 
@@ -1976,90 +1998,86 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             t_io_done = time.perf_counter() if profile else time.time()
             io_ms = (t_io_done - t_io_start) * 1000  # just dispatch time (~1ms)
 
-            # ===== PASS 2: Exact per-layer with cache-restored attention =====
-            # Cache was restored after Pass 1, so we can re-run attention correctly.
-            # For each layer: CORRECT attention → CORRECT routing → superset check → MoE
-            # This gives PERFECT quality while using the pre-read expert superset.
+            # ===== PASS 2 =====
             t_compute_start = time.perf_counter() if profile else time.time()
 
             _ss_hits = 0
             _ss_misses = 0
             _ss_fallback_bytes = 0
 
-            for i in range(num_layers):
-                if i not in all_superset_info:
-                    if i in all_pass1_data:
-                        # No experts for this layer — just run attention
-                        layer = layers[i]
-                        c = cache[i]
-                        x_normed = layer.input_layernorm(h)
-                        mask = ssm_mask if layer.is_linear else fa_mask
-                        r = layer.linear_attn(x_normed, mask, c) if layer.is_linear else layer.self_attn(x_normed, mask, c)
-                        h = h + r
-                    continue
+            if single_eval:
+                # ==============================================================
+                # SINGLE-EVAL PASS 2: Uses Pass 1's routing directly.
+                # No re-routing, no per-layer mx.eval(). Builds entire 60-layer
+                # computation graph with INLINE I/O waiting and weight conversion
+                # per layer, then evaluates with ONE mx.eval() at the end.
+                # ==============================================================
+                _se_t0 = time.perf_counter()
 
-                superset_list, superset_set, _, k_i = all_superset_info[i]
-                layer = layers[i]
-                c = cache[i]
+                # Build the entire 60-layer computation graph.
+                # For each layer: wait for that layer's I/O, convert weights,
+                # build compute graph (lazy). No mx.eval() until the very end.
+                _se_io_total = 0.0
+                _se_convert_total = 0.0
 
-                # Step 1: CORRECT attention (cache restored, h is correct)
-                x_normed = layer.input_layernorm(h)
-                mask = ssm_mask if layer.is_linear else fa_mask
-                r = layer.linear_attn(x_normed, mask, c) if layer.is_linear else layer.self_attn(x_normed, mask, c)
-                h_mid = h + r
+                for i in range(num_layers):
+                    if i not in all_superset_info:
+                        if i in all_pass1_data:
+                            layer = layers[i]
+                            c = cache[i]
+                            x_normed = layer.input_layernorm(h)
+                            mask = ssm_mask if layer.is_linear else fa_mask
+                            r = layer.linear_attn(x_normed, mask, c) if layer.is_linear else layer.self_attn(x_normed, mask, c)
+                            h = h + r
+                        continue
 
-                # Step 2: CORRECT routing with correct h
-                h_post = layer.post_attention_layernorm(h_mid)
-                gates = layer.mlp.gate(h_post)
-                gates = mx.softmax(gates, axis=-1, precise=True)
+                    superset_list, superset_set, _, k_i = all_superset_info[i]
+                    layer = layers[i]
+                    c = cache[i]
 
-                inds = mx.argpartition(gates, kth=-k_i, axis=-1)[..., -k_i:]
-                scores = mx.take_along_axis(gates, inds, axis=-1)
-                scores = scores / scores.sum(axis=-1, keepdims=True)
+                    # CORRECT attention with restored cache
+                    x_normed = layer.input_layernorm(h)
+                    mask = ssm_mask if layer.is_linear else fa_mask
+                    r = layer.linear_attn(x_normed, mask, c) if layer.is_linear else layer.self_attn(x_normed, mask, c)
+                    h_mid = h + r
 
-                # Must eval to get concrete indices for I/O decisions
-                mx.eval(inds)
+                    # Use Pass 1's top-K routing (pre-computed, already concrete)
+                    h_post = layer.post_attention_layernorm(h_mid)
+                    inds_topk_i = all_pass1_data[i][3]
+                    scores_topk_i = all_pass1_data[i][4]
 
-                inds_np = np.array(inds.tolist())
-                unique_experts = np.unique(inds_np)
-                unique_list = unique_experts.tolist()
-                num_unique = len(unique_experts)
+                    inds_np = np.array(inds_topk_i.tolist())
+                    unique_experts = np.unique(inds_np)
+                    num_unique = len(unique_experts)
+                    unique_list = unique_experts.tolist()
 
-                # Build remap table
-                remap = np.zeros(layer.mlp.num_experts, dtype=np.int32)
-                remap[unique_experts] = np.arange(num_unique)
-                remapped_inds = mx.array(remap[inds_np])
+                    # Build remap table
+                    remap = np.zeros(layer.mlp.num_experts, dtype=np.int32)
+                    remap[unique_experts] = np.arange(num_unique)
+                    remapped_inds = mx.array(remap[inds_np])
 
-                # Track warmup routing
-                if pin_phase == "warmup":
+                    # Track routing
+                    _token_routing[i] = unique_list
+                    if pin_phase == "warmup":
+                        for eidx in unique_list:
+                            pin_counts[i, eidx] += 1
+
+                    # Wait for THIS LAYER's expert I/O (just-in-time)
+                    _t_io = time.perf_counter()
+                    all_expert_attrs = {}
+                    layer_pinned = pinned_experts.get(i, {})
+                    if pin_phase == "active" and layer_pinned:
+                        for idx in unique_list:
+                            if idx in layer_pinned:
+                                all_expert_attrs[idx] = layer_pinned[idx]
+                                pin_total_hits += 1
+                        pin_total_lookups += len(unique_list)
+
                     for eidx in unique_list:
-                        pin_counts[i, eidx] += 1
-
-                # Populate _token_routing for speculative prefetch
-                _token_routing[i] = unique_list
-
-                # Step 3: Load experts — check superset first, fallback pread on miss
-                all_expert_attrs = {}
-
-                # Pinned experts (already in Metal memory)
-                layer_pinned = pinned_experts.get(i, {})
-                if pin_phase == "active" and layer_pinned:
-                    for idx in unique_list:
-                        if idx in layer_pinned:
-                            all_expert_attrs[idx] = layer_pinned[idx]
-                            pin_total_hits += 1
-                    pin_total_lookups += len(unique_list)
-
-                for eidx in unique_list:
-                    if eidx in all_expert_attrs:
-                        continue  # already pinned
-
-                    if eidx in superset_set:
-                        # SUPERSET HIT: expert was pre-read in batch I/O
-                        _ss_hits += 1
+                        if eidx in all_expert_attrs:
+                            continue
                         raw = all_raw_data.get((i, eidx))
                         if raw is None:
-                            # Wait for this specific batch read to complete
                             future = all_read_futures.get((i, eidx))
                             if future is not None:
                                 raw = future.result()
@@ -2070,92 +2088,266 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                                         numpy_cache.popitem(last=False)
                                 token_io_bytes += es
                                 token_io_seeks += 1
+                                _ss_hits += 1
+                            elif i in packed_layers:
+                                _ss_misses += 1
+                                packed_fd = packed_fds[i]
+                                raw = os.pread(packed_fd, es, eidx * es)
+                                all_raw_data[(i, eidx)] = raw
+                                _ss_fallback_bytes += es
+                                token_io_bytes += es
+                                token_io_seeks += 1
                             else:
-                                # Must be pinned or a bug — shouldn't happen
                                 raise RuntimeError(
-                                    f"Two-pass superset: layer={i} expert={eidx} "
-                                    f"in superset but no raw data or future")
-                    else:
-                        # SUPERSET MISS: expert not in pre-read set, fallback pread
-                        _ss_misses += 1
-                        if i in packed_layers:
-                            packed_fd = packed_fds[i]
-                            raw = os.pread(packed_fd, es, eidx * es)
-                            all_raw_data[(i, eidx)] = raw
-                            if numpy_cache is not None:
-                                numpy_cache[(i, eidx)] = raw
-                                while len(numpy_cache) > numpy_cache_max_entries:
-                                    numpy_cache.popitem(last=False)
-                            _ss_fallback_bytes += es
+                                    f"Single-eval: layer={i} expert={eidx} not in pre-read data")
+                        else:
+                            _ss_hits += 1
                             token_io_bytes += es
                             token_io_seeks += 1
-                        else:
-                            raise RuntimeError(
-                                f"Two-pass superset: layer={i} expert={eidx} "
-                                f"miss but layer not in packed_layers")
+                    _se_io_total += time.perf_counter() - _t_io
 
-                    # Convert raw bytes to mx.arrays
-                    raw = all_raw_data[(i, eidx)]
-                    mv = memoryview(raw)
-                    attrs = {}
-                    for proj, attr, off, sz, npdtype, shape, is_bf16 in _packed_comps:
-                        arr = mx.array(np.frombuffer(mv[off:off+sz], dtype=npdtype).reshape(shape))
-                        if is_bf16:
-                            arr = arr.view(mx.bfloat16)
-                        attrs[(proj, attr)] = arr
-                    all_expert_attrs[eidx] = attrs
+                    # Convert raw bytes to mx.arrays and stack
+                    _t_conv = time.perf_counter()
+                    for eidx in unique_list:
+                        if eidx in all_expert_attrs:
+                            continue
+                        raw = all_raw_data[(i, eidx)]
+                        mv = memoryview(raw)
+                        attrs = {}
+                        for proj, attr, off, sz, npdtype, shape, is_bf16 in _packed_comps:
+                            arr = mx.array(np.frombuffer(mv[off:off+sz], dtype=npdtype).reshape(shape))
+                            if is_bf16:
+                                arr = arr.view(mx.bfloat16)
+                            attrs[(proj, attr)] = arr
+                        all_expert_attrs[eidx] = attrs
 
-                # Step 4: Assemble stacked weight tensors
-                expert_tensors = {}
-                for proj_name in ["gate_proj", "up_proj", "down_proj"]:
-                    for attr_name in ["weight", "scales", "biases"]:
-                        slices = []
+                    expert_tensors = {}
+                    for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+                        for attr_name in ["weight", "scales", "biases"]:
+                            slices = [all_expert_attrs[idx][(proj_name, attr_name)]
+                                      for idx in unique_list
+                                      if (proj_name, attr_name) in all_expert_attrs[idx]]
+                            if slices:
+                                expert_tensors[f"{proj_name}.{attr_name}"] = mx.stack(slices, axis=0)
+                    del all_expert_attrs
+                    _se_convert_total += time.perf_counter() - _t_conv
+
+                    # Compute MoE (LAZY — no eval)
+                    y = compute_moe_direct(
+                        h_post, remapped_inds, expert_tensors,
+                        group_size=qparams["group_size"],
+                        bits=qparams["bits"],
+                        mode=qparams["mode"],
+                    )
+                    y = (y * scores_topk_i[..., None]).sum(axis=-2)
+
+                    # Shared expert
+                    shared_y = layer.mlp.shared_expert(h_post)
+                    shared_y = mx.sigmoid(layer.mlp.shared_expert_gate(h_post)) * shared_y
+
+                    h = h_mid + y + shared_y
+
+                    del expert_tensors
+
+                    layer_timings.append({
+                        "layer": i,
+                        "is_linear": layer.is_linear,
+                        "attn_router_ms": pass1_ms / num_layers,
+                        "expert_ms": 0.0,
+                        "clear_ms": 0.0,
+                        "load_ms": 0.0,
+                        "compute_ms": 0.0,
+                    })
+
+                # SINGLE eval for entire 60-layer computation
+                _se_graph_done = time.perf_counter()
+                mx.eval(h)
+                _se_eval_done = time.perf_counter()
+
+                preprocess_ms = (_se_graph_done - _se_t0) * 1000
+
+                if token_idx <= 2:
+                    print(f"    [single-eval] io_wait: {_se_io_total*1000:.1f}ms, "
+                          f"convert: {_se_convert_total*1000:.1f}ms, "
+                          f"graph+attn: {(_se_graph_done - _se_t0 - _se_io_total - _se_convert_total)*1000:.1f}ms, "
+                          f"mx.eval: {(_se_eval_done - _se_graph_done)*1000:.1f}ms, "
+                          f"total: {(_se_eval_done - _se_t0)*1000:.1f}ms")
+
+            else:
+                # ===== STANDARD PASS 2: re-routes per layer (per-layer eval) =====
+                # Cache was restored after Pass 1, so we can re-run attention correctly.
+                # For each layer: CORRECT attention -> CORRECT routing -> superset check -> MoE
+
+                for i in range(num_layers):
+                    if i not in all_superset_info:
+                        if i in all_pass1_data:
+                            # No experts for this layer — just run attention
+                            layer = layers[i]
+                            c = cache[i]
+                            x_normed = layer.input_layernorm(h)
+                            mask = ssm_mask if layer.is_linear else fa_mask
+                            r = layer.linear_attn(x_normed, mask, c) if layer.is_linear else layer.self_attn(x_normed, mask, c)
+                            h = h + r
+                        continue
+
+                    superset_list, superset_set, _, k_i = all_superset_info[i]
+                    layer = layers[i]
+                    c = cache[i]
+
+                    # Step 1: CORRECT attention (cache restored, h is correct)
+                    x_normed = layer.input_layernorm(h)
+                    mask = ssm_mask if layer.is_linear else fa_mask
+                    r = layer.linear_attn(x_normed, mask, c) if layer.is_linear else layer.self_attn(x_normed, mask, c)
+                    h_mid = h + r
+
+                    # Step 2: CORRECT routing with correct h
+                    h_post = layer.post_attention_layernorm(h_mid)
+                    gates = layer.mlp.gate(h_post)
+                    gates = mx.softmax(gates, axis=-1, precise=True)
+
+                    inds = mx.argpartition(gates, kth=-k_i, axis=-1)[..., -k_i:]
+                    scores = mx.take_along_axis(gates, inds, axis=-1)
+                    scores = scores / scores.sum(axis=-1, keepdims=True)
+
+                    # Must eval to get concrete indices for I/O decisions
+                    mx.eval(inds)
+
+                    inds_np = np.array(inds.tolist())
+                    unique_experts = np.unique(inds_np)
+                    unique_list = unique_experts.tolist()
+                    num_unique = len(unique_experts)
+
+                    # Build remap table
+                    remap = np.zeros(layer.mlp.num_experts, dtype=np.int32)
+                    remap[unique_experts] = np.arange(num_unique)
+                    remapped_inds = mx.array(remap[inds_np])
+
+                    # Track warmup routing
+                    if pin_phase == "warmup":
+                        for eidx in unique_list:
+                            pin_counts[i, eidx] += 1
+
+                    # Populate _token_routing for speculative prefetch
+                    _token_routing[i] = unique_list
+
+                    # Step 3: Load experts — check superset first, fallback pread on miss
+                    all_expert_attrs = {}
+
+                    # Pinned experts (already in Metal memory)
+                    layer_pinned = pinned_experts.get(i, {})
+                    if pin_phase == "active" and layer_pinned:
                         for idx in unique_list:
-                            arr = all_expert_attrs[idx].get((proj_name, attr_name))
-                            if arr is not None:
-                                slices.append(arr)
+                            if idx in layer_pinned:
+                                all_expert_attrs[idx] = layer_pinned[idx]
+                                pin_total_hits += 1
+                        pin_total_lookups += len(unique_list)
+
+                    for eidx in unique_list:
+                        if eidx in all_expert_attrs:
+                            continue  # already pinned
+
+                        if eidx in superset_set:
+                            # SUPERSET HIT: expert was pre-read in batch I/O
+                            _ss_hits += 1
+                            raw = all_raw_data.get((i, eidx))
+                            if raw is None:
+                                # Wait for this specific batch read to complete
+                                future = all_read_futures.get((i, eidx))
+                                if future is not None:
+                                    raw = future.result()
+                                    all_raw_data[(i, eidx)] = raw
+                                    if numpy_cache is not None:
+                                        numpy_cache[(i, eidx)] = raw
+                                        while len(numpy_cache) > numpy_cache_max_entries:
+                                            numpy_cache.popitem(last=False)
+                                    token_io_bytes += es
+                                    token_io_seeks += 1
+                                else:
+                                    # Must be pinned or a bug — shouldn't happen
+                                    raise RuntimeError(
+                                        f"Two-pass superset: layer={i} expert={eidx} "
+                                        f"in superset but no raw data or future")
+                        else:
+                            # SUPERSET MISS: expert not in pre-read set, fallback pread
+                            _ss_misses += 1
+                            if i in packed_layers:
+                                packed_fd = packed_fds[i]
+                                raw = os.pread(packed_fd, es, eidx * es)
+                                all_raw_data[(i, eidx)] = raw
+                                if numpy_cache is not None:
+                                    numpy_cache[(i, eidx)] = raw
+                                    while len(numpy_cache) > numpy_cache_max_entries:
+                                        numpy_cache.popitem(last=False)
+                                _ss_fallback_bytes += es
+                                token_io_bytes += es
+                                token_io_seeks += 1
                             else:
                                 raise RuntimeError(
-                                    f"Two-pass superset: layer={i} expert={idx} "
-                                    f"{proj_name}.{attr_name} not found"
-                                )
-                        if slices:
-                            expert_tensors[f"{proj_name}.{attr_name}"] = mx.stack(slices, axis=0)
-                del all_expert_attrs
+                                    f"Two-pass superset: layer={i} expert={eidx} "
+                                    f"miss but layer not in packed_layers")
 
-                # Step 5: Compute MoE with CORRECT h_post and CORRECT experts
-                y = compute_moe_direct(
-                    h_post, remapped_inds, expert_tensors,
-                    group_size=qparams["group_size"],
-                    bits=qparams["bits"],
-                    mode=qparams["mode"],
-                )
-                y = (y * scores[..., None]).sum(axis=-2)
+                        # Convert raw bytes to mx.arrays
+                        raw = all_raw_data[(i, eidx)]
+                        mv = memoryview(raw)
+                        attrs = {}
+                        for proj, attr, off, sz, npdtype, shape, is_bf16 in _packed_comps:
+                            arr = mx.array(np.frombuffer(mv[off:off+sz], dtype=npdtype).reshape(shape))
+                            if is_bf16:
+                                arr = arr.view(mx.bfloat16)
+                            attrs[(proj, attr)] = arr
+                        all_expert_attrs[eidx] = attrs
 
-                # Shared expert (uses corrected h_post)
-                shared_y = layer.mlp.shared_expert(h_post)
-                shared_y = mx.sigmoid(layer.mlp.shared_expert_gate(h_post)) * shared_y
-                routed_and_shared = y + shared_y
+                    # Step 4: Assemble stacked weight tensors
+                    expert_tensors = {}
+                    for proj_name in ["gate_proj", "up_proj", "down_proj"]:
+                        for attr_name in ["weight", "scales", "biases"]:
+                            slices = []
+                            for idx in unique_list:
+                                arr = all_expert_attrs[idx].get((proj_name, attr_name))
+                                if arr is not None:
+                                    slices.append(arr)
+                                else:
+                                    raise RuntimeError(
+                                        f"Two-pass superset: layer={i} expert={idx} "
+                                        f"{proj_name}.{attr_name} not found"
+                                    )
+                            if slices:
+                                expert_tensors[f"{proj_name}.{attr_name}"] = mx.stack(slices, axis=0)
+                    del all_expert_attrs
 
-                # Update h: CORRECT attention output + expert output
-                h = h_mid + routed_and_shared
+                    # Step 5: Compute MoE with CORRECT h_post and CORRECT experts
+                    y = compute_moe_direct(
+                        h_post, remapped_inds, expert_tensors,
+                        group_size=qparams["group_size"],
+                        bits=qparams["bits"],
+                        mode=qparams["mode"],
+                    )
+                    y = (y * scores[..., None]).sum(axis=-2)
 
-                # Eval only at end (routing eval per layer already done above)
-                if i == num_layers - 1:
-                    mx.eval(h)
+                    # Shared expert (uses corrected h_post)
+                    shared_y = layer.mlp.shared_expert(h_post)
+                    shared_y = mx.sigmoid(layer.mlp.shared_expert_gate(h_post)) * shared_y
+                    routed_and_shared = y + shared_y
 
-                del expert_tensors
+                    # Update h: CORRECT attention output + expert output
+                    h = h_mid + routed_and_shared
 
-                # Record layer timing (amortized — detailed timing not available per-layer)
-                layer_timings.append({
-                    "layer": i,
-                    "is_linear": layer.is_linear,
-                    "attn_router_ms": pass1_ms / num_layers,
-                    "expert_ms": io_ms / num_layers,
-                    "clear_ms": 0.0,
-                    "load_ms": io_ms / num_layers,
-                    "compute_ms": 0.0,
-                })
+                    # Eval only at end (routing eval per layer already done above)
+                    if i == num_layers - 1:
+                        mx.eval(h)
+
+                    del expert_tensors
+
+                    # Record layer timing (amortized — detailed timing not available per-layer)
+                    layer_timings.append({
+                        "layer": i,
+                        "is_linear": layer.is_linear,
+                        "attn_router_ms": pass1_ms / num_layers,
+                        "expert_ms": io_ms / num_layers,
+                        "clear_ms": 0.0,
+                        "load_ms": io_ms / num_layers,
+                        "compute_ms": 0.0,
+                    })
 
             t_compute_done = time.perf_counter() if profile else time.time()
             compute_ms = (t_compute_done - t_compute_start) * 1000
@@ -3500,19 +3692,20 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         if _two_pass_handled:
             # Two-pass progress display (with superset hit rate)
             _ss_str = f"ss={_ss_hit_rate:.0%}" if _ss_total > 0 else "ss=n/a"
+            _mode_label = "single-eval" if single_eval else "two-pass"
             if token_idx == 0:
                 ttft_ms = token_time * 1000
                 print(f"  [{fmt_time(t_token_end - t_start)}] Token 1/{max_tokens}: "
-                      f"ttft={ttft_ms:.0f}ms [two-pass: scout={pass1_ms:.0f}ms "
-                      f"io={io_ms:.0f}ms exact={compute_ms:.0f}ms "
+                      f"ttft={ttft_ms:.0f}ms [{_mode_label}: scout={pass1_ms:.0f}ms "
+                      f"io={io_ms:.0f}ms compute={compute_ms:.0f}ms "
                       f"{_ss_str} miss={_ss_misses} "
                       f"total={total_two_pass_ms:.0f}ms mem={cur_mem:.1f}GB]")
             elif (token_idx + 1) % 5 == 0 or token_idx == max_tokens - 1:
                 elapsed = t_token_end - t_start
                 avg_tps = (token_idx + 1) / elapsed
                 print(f"  [{fmt_time(elapsed)}] Token {token_idx+1}/{max_tokens}: "
-                      f"{avg_tps:.2f} tok/s [two-pass: scout={pass1_ms:.0f}ms "
-                      f"io={io_ms:.0f}ms exact={compute_ms:.0f}ms "
+                      f"{avg_tps:.2f} tok/s [{_mode_label}: scout={pass1_ms:.0f}ms "
+                      f"io={io_ms:.0f}ms compute={compute_ms:.0f}ms "
                       f"{_ss_str} miss={_ss_misses} "
                       f"total={total_two_pass_ms:.0f}ms mem={cur_mem:.1f}GB]")
         elif token_idx == 0:
@@ -5042,6 +5235,15 @@ def main():
                              "routing with corrected h, uses pre-read superset (~90% hit rate) "
                              "with fallback pread on miss. PERFECT quality output. "
                              "Requires --batch-experts --no-expert-cache and packed expert files.")
+    parser.add_argument("--single-eval", action="store_true", default=False,
+                        help="Single-eval mode for two-pass inference. Instead of re-running "
+                             "routing per layer in Pass 2 (which forces mx.eval sync per layer), "
+                             "uses Pass 1's routing directly and builds the entire 60-layer MoE "
+                             "computation graph lazily. One mx.eval() at the end evaluates all "
+                             "expert computation in a single Metal command buffer dispatch. "
+                             "Eliminates ~14ms of eval overhead (62%% of MoE compute time). "
+                             "Quality trade-off: uses approximate routing from Pass 1 instead of "
+                             "correct routing with corrected h. Requires --two-pass.")
     args = parser.parse_args()
 
     # Validate --cache-gb range
@@ -5076,6 +5278,11 @@ def main():
     if args.two_pass and args.mode != "offload_selective":
         print(f"WARNING: --two-pass only works with offload_selective mode. Ignoring.")
         args.two_pass = False
+
+    # Validate --single-eval requires --two-pass
+    if args.single_eval and not args.two_pass:
+        print(f"WARNING: --single-eval requires --two-pass. Ignoring.")
+        args.single_eval = False
 
     if args.pin_experts > 0 and args.pin_experts >= args.tokens:
         print(f"WARNING: --pin-experts ({args.pin_experts}) >= --tokens ({args.tokens}). "
@@ -5286,7 +5493,8 @@ def main():
                                             skip_layers=args.skip_layers,
                                             batch_layers=args.batch_layers,
                                             numpy_cache_gb=args.numpy_cache_gb,
-                                            two_pass=args.two_pass)
+                                            two_pass=args.two_pass,
+                                            single_eval=args.single_eval)
     elif args.mode in ("offload", "offload_lazy"):
         # Offload mode: explicit per-layer load -> compute -> clear cycle.
         # Only way to run models larger than DRAM without OS thrashing.
