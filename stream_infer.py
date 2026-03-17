@@ -2118,7 +2118,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                     _t_io = time.perf_counter()
                     if _fwl_load_list:
                         import fast_weight_load
-                        fast_weight_load.load_experts_coalesced(_fwl_load_list)
+                        fast_weight_load.load_experts(_fwl_load_list)
                     _se_io_total = time.perf_counter() - _t_io
 
                     # Track I/O stats
