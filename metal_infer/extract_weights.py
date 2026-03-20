@@ -40,7 +40,7 @@ def parse_safetensors_header(filepath):
 def main():
     parser = argparse.ArgumentParser(description='Extract non-expert weights to binary')
     parser.add_argument('--model', type=str,
-                        default=os.path.expanduser(
+                        default=os.environ.get('FLASH_MOE_MODEL') or os.path.expanduser(
                             '~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit'
                             '/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3'),
                         help='Path to model directory')
