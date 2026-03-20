@@ -2740,8 +2740,8 @@ static void moe_forward(
                 void *expert_buf_ptr = [g_metal->buf_expert_data contents];
                 ssize_t nread = pread(packed_fd, expert_buf_ptr, esz, expert_offset);
                 if (nread != (ssize_t)esz) {
-                    fprintf(stderr, "WARNING: layer %d expert %d pread: %zd/%zu\n",
-                            layer_idx, eidx, nread, esz);
+                    fprintf(stderr, "WARNING: layer %d expert %d pread: %zd/%zu (%s)\n",
+                            layer_idx, eidx, nread, esz, strerror(errno));
                     continue;
                 }
 
@@ -2751,8 +2751,8 @@ static void moe_forward(
                 void *expert_data = malloc(esz);
                 ssize_t nread = pread(packed_fd, expert_data, esz, expert_offset);
                 if (nread != (ssize_t)esz) {
-                    fprintf(stderr, "WARNING: layer %d expert %d pread: %zd/%zu\n",
-                            layer_idx, eidx, nread, esz);
+                    fprintf(stderr, "WARNING: layer %d expert %d pread: %zd/%zu (%s)\n",
+                            layer_idx, eidx, nread, esz, strerror(errno));
                     free(expert_data);
                     continue;
                 }
@@ -2947,6 +2947,7 @@ typedef struct {
     off_t offset;
     size_t size;
     ssize_t result;
+    int err;                // errno from pread (saved by worker thread)
     const void *mmap_base;  // if non-NULL, memcpy from mmap instead of pread
     // LZ4 compression fields (set by caller when reading compressed experts)
     void *lz4_comp_buf;     // if non-NULL: pread into this, then LZ4 decompress into dst
@@ -2964,6 +2965,7 @@ static void *infer_pread_thread_fn(void *arg) {
     for (int i = ta->thread_id; i < ta->num_tasks; i += NUM_IO_THREADS) {
         InferPreadTask *t = &ta->tasks[i];
         t->result = pread(t->fd, t->dst, t->size, t->offset);
+        t->err = (t->result < 0) ? errno : 0;
     }
     return NULL;
 }
@@ -3013,11 +3015,14 @@ static void *io_pool_worker(void *arg) {
                         t->dst, t->size, t->lz4_comp_buf, t->lz4_comp_size,
                         NULL, COMPRESSION_LZ4);
                     t->result = (ssize_t)dec;
+                    t->err = 0;
                 } else {
+                    t->err = errno;
                     t->result = -1;
                 }
             } else {
                 t->result = pread(t->fd, t->dst, t->size, t->offset);
+                t->err = (t->result < 0) ? errno : 0;
             }
         }
 
@@ -3080,11 +3085,11 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
     if (!g_async_pread.group) g_async_pread.group = dispatch_group_create();
 
     for (int k = 0; k < K; k++) {
+        memset(&g_async_pread.tasks[k], 0, sizeof(InferPreadTask));
         g_async_pread.tasks[k].fd = packed_fd;
         g_async_pread.tasks[k].dst = [dst_bufs[k] contents];
         g_async_pread.tasks[k].offset = (off_t)expert_indices[k] * esz;
         g_async_pread.tasks[k].size = esz;
-        g_async_pread.tasks[k].result = 0;
     }
 
     // Fire off parallel preads on GCD — returns immediately
@@ -3131,7 +3136,7 @@ static int parallel_pread_experts(
     const void *mmap_base  // mmap'd layer file (NULL to use pread)
 ) {
     size_t esz = active_expert_size();
-    InferPreadTask tasks[MAX_K];
+    InferPreadTask tasks[MAX_K] = {0};
     for (int k = 0; k < K; k++) {
         tasks[k].fd = packed_fd;
         tasks[k].dst = [g_metal->buf_multi_expert_data[k] contents];
@@ -3148,8 +3153,8 @@ static int parallel_pread_experts(
         valid[k] = (tasks[k].result == (ssize_t)esz);
         if (valid[k]) loaded++;
         else {
-            fprintf(stderr, "WARNING: expert %d pread: %zd/%zu\n",
-                    expert_indices[k], tasks[k].result, esz);
+            fprintf(stderr, "WARNING: expert %d pread: %zd/%zu (%s)\n",
+                    expert_indices[k], tasks[k].result, esz, strerror(tasks[k].err));
         }
     }
     return loaded;
@@ -3167,7 +3172,7 @@ static int parallel_pread_experts_into(
     int *valid  // [MAX_K] output: 1 if expert loaded successfully
 ) {
     size_t esz = active_expert_size();
-    InferPreadTask tasks[MAX_K];
+    InferPreadTask tasks[MAX_K] = {0};
     for (int k = 0; k < K; k++) {
         tasks[k].fd = packed_fd;
         tasks[k].dst = [dst_bufs[k] contents];
@@ -3183,8 +3188,8 @@ static int parallel_pread_experts_into(
         valid[k] = (tasks[k].result == (ssize_t)esz);
         if (valid[k]) loaded++;
         else {
-            fprintf(stderr, "WARNING: expert %d pread: %zd/%zu\n",
-                    expert_indices[k], tasks[k].result, esz);
+            fprintf(stderr, "WARNING: expert %d pread: %zd/%zu (%s)\n",
+                    expert_indices[k], tasks[k].result, esz, strerror(tasks[k].err));
         }
     }
     return loaded;
@@ -3554,7 +3559,7 @@ static void *infer_prefetch_thread_fn(void *arg) {
         // Execute parallel pread (pure C, no ARC objects)
         size_t esz = active_expert_size();
         InferIOPlan *plan = &pf->plan;
-        InferPreadTask tasks[MAX_K];
+        InferPreadTask tasks[MAX_K] = {0};
         for (int k = 0; k < plan->K; k++) {
             tasks[k].fd = plan->fd;
             tasks[k].dst = plan->dst[k];
@@ -5116,7 +5121,7 @@ static void fused_layer_forward(
             // Phase 2: parallel pread misses directly into cache buffers (zero-copy)
             if (num_misses > 0) {
                 size_t esz = active_expert_size();
-                InferPreadTask tasks[MAX_K];
+                InferPreadTask tasks[MAX_K] = {0};
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
                     int cidx = miss_cache_idx[m];
@@ -5135,8 +5140,8 @@ static void fused_layer_forward(
                     int k = miss_indices[m];
                     valid[k] = (tasks[m].result == (ssize_t)esz);
                     if (!valid[k]) {
-                        fprintf(stderr, "WARNING: expert %d pread: %zd/%zu\n",
-                                expert_indices[k], tasks[m].result, esz);
+                        fprintf(stderr, "WARNING: expert %d pread: %zd/%zu (%s)\n",
+                                expert_indices[k], tasks[m].result, esz, strerror(tasks[m].err));
                     }
                 }
             }
@@ -5172,7 +5177,7 @@ static void fused_layer_forward(
             // Phase 2: parallel pread all cache misses
             if (num_misses > 0) {
                 size_t esz = active_expert_size();
-                InferPreadTask tasks[MAX_K];
+                InferPreadTask tasks[MAX_K] = {0};
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
                     tasks[m].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
@@ -5190,8 +5195,8 @@ static void fused_layer_forward(
                     int k = miss_indices[m];
                     valid[k] = (tasks[m].result == (ssize_t)esz);
                     if (!valid[k]) {
-                        fprintf(stderr, "WARNING: expert %d pread: %zd/%zu\n",
-                                expert_indices[k], tasks[m].result, esz);
+                        fprintf(stderr, "WARNING: expert %d pread: %zd/%zu (%s)\n",
+                                expert_indices[k], tasks[m].result, esz, strerror(tasks[m].err));
                     }
                 }
             }
@@ -5232,7 +5237,7 @@ static void fused_layer_forward(
 
             // Parallel sync-pread misses into buf_A
             if (miss_count > 0) {
-                InferPreadTask tasks[MAX_K];
+                InferPreadTask tasks[MAX_K] = {0};
                 size_t esz = active_expert_size();
                 for (int m = 0; m < miss_count; m++) {
                     int k = miss_k_slots[m];
@@ -5251,7 +5256,7 @@ static void fused_layer_forward(
         } else if (g_use_lz4 && g_lz4_index[layer_idx]) {
             // ---- LZ4 compressed path: read compressed + decompress via io_pool ----
             size_t esz = active_expert_size();
-            InferPreadTask tasks[MAX_K];
+            InferPreadTask tasks[MAX_K] = {0};
             for (int k = 0; k < actual_K; k++) {
                 LZ4IndexEntry *ie = &g_lz4_index[layer_idx][expert_indices[k]];
                 tasks[k].fd = packed_fd;
@@ -5473,8 +5478,8 @@ static void fused_layer_forward(
             void *expert_data = malloc(esz);
             ssize_t nread = pread(packed_fd, expert_data, esz, expert_offset);
             if (nread != (ssize_t)esz) {
-                fprintf(stderr, "WARNING: layer %d expert %d pread: %zd/%zu\n",
-                        layer_idx, eidx, nread, esz);
+                fprintf(stderr, "WARNING: layer %d expert %d pread: %zd/%zu (%s)\n",
+                        layer_idx, eidx, nread, esz, strerror(errno));
                 free(expert_data);
                 continue;
             }
